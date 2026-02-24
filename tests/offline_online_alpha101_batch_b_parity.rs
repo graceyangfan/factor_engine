@@ -1,0 +1,1027 @@
+use factor_engine::types::{CompileOptions, Universe};
+use factor_engine::{
+    AdvancePolicy, Engine, FactorRequest, InputFieldCatalog, OnlineFactorEngine, Planner,
+    SimplePlanner,
+};
+use std::collections::{BTreeMap, HashMap};
+
+mod common;
+use common::alpha101::*;
+
+#[test]
+fn polars_offline_matches_online_alpha101_batch_b_more_complex_set() {
+    if !python_polars_available() {
+        eprintln!("skip: python3/polars unavailable");
+        return;
+    }
+
+    let universe = vec![9401_u32, 9402, 9403, 9404, 9405, 9406];
+    let ts_points: Vec<i64> = (1..=460).collect();
+    let outputs = vec![
+        "alpha021".to_string(),
+        "alpha023".to_string(),
+        "alpha024".to_string(),
+        "alpha025".to_string(),
+        "alpha027".to_string(),
+        "alpha028".to_string(),
+        "alpha033".to_string(),
+        "alpha034".to_string(),
+        "alpha035".to_string(),
+        "alpha041".to_string(),
+        "alpha042".to_string(),
+    ];
+
+    let expr_alpha021 = "elem_where(((ts_sum(close, 8) / 8) + ts_std(close, 8)) < (ts_sum(close, 2) / 2), -1, elem_where((ts_sum(close, 2) / 2) < ((ts_sum(close, 8) / 8) - ts_std(close, 8)), 1, elem_where((1 < (volume / ts_mean(volume, 20))) | ((volume / ts_mean(volume, 20)) == 1), 1, -1)))";
+    let expr_alpha023 = "elem_where((ts_sum(high, 20) / 20) < high, -1 * ts_delta(high, 2), 0)";
+    let expr_alpha024 = "elem_where(((ts_delta(ts_sum(close, 100) / 100, 100) / ts_lag(close, 100)) < 0.05) | ((ts_delta(ts_sum(close, 100) / 100, 100) / ts_lag(close, 100)) == 0.05), -1 * (close - ts_min(close, 100)), -1 * ts_delta(close, 3))";
+    let expr_alpha025 = "cs_rank(-1 * (ts_delta(close, 1) / (ts_lag(close, 1) + 0.000001)) * ts_mean(volume, 20) * ((open + high + low + close) / 4) * (high - close))";
+    let expr_alpha027 = "elem_where(0.5 < cs_rank(ts_sum(ts_corr(cs_rank(volume), cs_rank((open + high + low + close) / 4), 6), 2) / 2), -1, 1)";
+    let expr_alpha028 =
+        "cs_scale(ts_corr(ts_mean(volume, 20), low, 5) + ((high + low) / 2) - close)";
+    let expr_alpha033 = "cs_rank(-1 * elem_pow(1 - (open / close), 1))";
+    let expr_alpha034 = "cs_rank((1 - cs_rank(ts_std((ts_delta(close, 1) / (ts_lag(close, 1) + 0.000001)), 2) / ts_std((ts_delta(close, 1) / (ts_lag(close, 1) + 0.000001)), 5))) + (1 - cs_rank(ts_delta(close, 1))))";
+    let expr_alpha035 = "ts_rank(volume, 32) * (1 - ts_rank(close + high - low, 16)) * (1 - ts_rank((ts_delta(close, 1) / (ts_lag(close, 1) + 0.000001)), 32))";
+    let expr_alpha041 = "elem_pow(high * low, 0.5) - ((open + high + low + close) / 4)";
+    let expr_alpha042 = "cs_rank(((open + high + low + close) / 4) - close) / cs_rank(((open + high + low + close) / 4) + close)";
+
+    let request = FactorRequest {
+        exprs: vec![
+            expr_alpha021.to_string(),
+            expr_alpha023.to_string(),
+            expr_alpha024.to_string(),
+            expr_alpha025.to_string(),
+            expr_alpha027.to_string(),
+            expr_alpha028.to_string(),
+            expr_alpha033.to_string(),
+            expr_alpha034.to_string(),
+            expr_alpha035.to_string(),
+            expr_alpha041.to_string(),
+            expr_alpha042.to_string(),
+        ],
+        outputs: outputs.clone(),
+        opts: CompileOptions::default(),
+    };
+
+    let planner = SimplePlanner;
+    let (logical, manifest) = planner.compile(&request).expect("compile should succeed");
+    assert_eq!(manifest.expr_count, outputs.len(), "{manifest:?}");
+    assert!(manifest.cse_hit_count >= 18, "{manifest:?}");
+
+    let catalog = InputFieldCatalog::new(vec![
+        "bar.open".to_string(),
+        "bar.high".to_string(),
+        "bar.low".to_string(),
+        "bar.close".to_string(),
+        "bar.volume".to_string(),
+    ]);
+    let physical = planner
+        .bind(
+            &logical,
+            &Universe::new(universe.clone()),
+            &catalog,
+            AdvancePolicy::StrictAllReady,
+        )
+        .expect("bind should succeed");
+    let mut engine = OnlineFactorEngine::default();
+    engine.load(physical).expect("load should succeed");
+
+    let mut offline_rows = Vec::new();
+    let mut streaming = HashMap::new();
+    for &ts in &ts_points {
+        for (inst_idx, &instrument_slot) in universe.iter().enumerate() {
+            let base = (inst_idx + 1) as f64;
+            let t = ts as f64;
+            let open = 60.0
+                + 2.3 * base
+                + t * (0.07 + 0.005 * base)
+                + (t * (0.012 + 0.002 * base)).sin() * (0.85 + 0.07 * base);
+            let close = open
+                + base * 0.09
+                + (t * (0.019 + 0.003 * base)).cos() * (0.42 + 0.05 * base)
+                + (t * t) * (0.000015 * base);
+            let high = open.max(close) + 0.23 + base * 0.014;
+            let low = open.min(close) - 0.22 - base * 0.012;
+            let volume = 2100.0
+                + 75.0 * base
+                + t * (2.4 + 0.16 * base)
+                + (t * (0.014 + 0.0025 * base)).cos() * 55.0;
+
+            engine
+                .on_event(&bar_event_ohlcv(
+                    ts,
+                    instrument_slot,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                ))
+                .expect("bar event should succeed");
+            offline_rows.push(OfflineInputRow {
+                ts,
+                instrument_slot,
+                fields: BTreeMap::from([
+                    ("open".to_string(), open),
+                    ("high".to_string(), high),
+                    ("low".to_string(), low),
+                    ("close".to_string(), close),
+                    ("volume".to_string(), volume),
+                ]),
+            });
+        }
+        let frame = engine.advance(ts).expect("advance should succeed");
+        record_frame_results(&mut streaming, &frame, &outputs, &universe, ts);
+    }
+
+    let offline_all = run_polars_offline(&LegacyOfflinePayload {
+        rows: offline_rows,
+        expressions: vec![
+            // common base series
+            expr(
+                "__vwap_oh",
+                "elem_add",
+                None,
+                Some("open"),
+                Some("high"),
+                None,
+                None,
+            ),
+            expr(
+                "__vwap_lc",
+                "elem_add",
+                None,
+                Some("low"),
+                Some("close"),
+                None,
+                None,
+            ),
+            expr(
+                "__vwap_num",
+                "elem_add",
+                None,
+                Some("__vwap_oh"),
+                Some("__vwap_lc"),
+                None,
+                None,
+            ),
+            expr(
+                "__vwap",
+                "elem_div",
+                None,
+                Some("__vwap_num"),
+                Some("4"),
+                None,
+                None,
+            ),
+            expr(
+                "__close_lag1",
+                "ts_lag",
+                Some("close"),
+                None,
+                None,
+                None,
+                Some(1),
+            ),
+            expr(
+                "__ret_num",
+                "ts_delta",
+                Some("close"),
+                None,
+                None,
+                None,
+                Some(1),
+            ),
+            expr(
+                "__ret_den",
+                "elem_add",
+                None,
+                Some("__close_lag1"),
+                Some("0.000001"),
+                None,
+                None,
+            ),
+            expr(
+                "__returns",
+                "elem_div",
+                None,
+                Some("__ret_num"),
+                Some("__ret_den"),
+                None,
+                None,
+            ),
+            expr(
+                "__adv20",
+                "ts_mean",
+                Some("volume"),
+                None,
+                None,
+                Some(20),
+                None,
+            ),
+            // alpha021
+            expr(
+                "__a021_sum8",
+                "ts_sum",
+                Some("close"),
+                None,
+                None,
+                Some(8),
+                None,
+            ),
+            expr(
+                "__a021_mean8",
+                "elem_div",
+                None,
+                Some("__a021_sum8"),
+                Some("8"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_std8",
+                "ts_std",
+                Some("close"),
+                None,
+                None,
+                Some(8),
+                None,
+            ),
+            expr(
+                "__a021_left",
+                "elem_add",
+                None,
+                Some("__a021_mean8"),
+                Some("__a021_std8"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_sum2",
+                "ts_sum",
+                Some("close"),
+                None,
+                None,
+                Some(2),
+                None,
+            ),
+            expr(
+                "__a021_mean2",
+                "elem_div",
+                None,
+                Some("__a021_sum2"),
+                Some("2"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_cmp1",
+                "elem_lt",
+                None,
+                Some("__a021_left"),
+                Some("__a021_mean2"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_right2",
+                "elem_sub",
+                None,
+                Some("__a021_mean8"),
+                Some("__a021_std8"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_cmp2",
+                "elem_lt",
+                None,
+                Some("__a021_mean2"),
+                Some("__a021_right2"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_va",
+                "elem_div",
+                None,
+                Some("volume"),
+                Some("__adv20"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_cmp3a",
+                "elem_lt",
+                None,
+                Some("1"),
+                Some("__a021_va"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_cmp3b",
+                "elem_eq",
+                None,
+                Some("__a021_va"),
+                Some("1"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_cmp3",
+                "elem_or",
+                None,
+                Some("__a021_cmp3a"),
+                Some("__a021_cmp3b"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_w3",
+                "elem_where",
+                Some("__a021_cmp3"),
+                Some("1"),
+                Some("-1"),
+                None,
+                None,
+            ),
+            expr(
+                "__a021_w2",
+                "elem_where",
+                Some("__a021_cmp2"),
+                Some("1"),
+                Some("__a021_w3"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha021",
+                "elem_where",
+                Some("__a021_cmp1"),
+                Some("-1"),
+                Some("__a021_w2"),
+                None,
+                None,
+            ),
+            // alpha023
+            expr(
+                "__a023_sumh20",
+                "ts_sum",
+                Some("high"),
+                None,
+                None,
+                Some(20),
+                None,
+            ),
+            expr(
+                "__a023_meanh20",
+                "elem_div",
+                None,
+                Some("__a023_sumh20"),
+                Some("20"),
+                None,
+                None,
+            ),
+            expr(
+                "__a023_cond",
+                "elem_lt",
+                None,
+                Some("__a023_meanh20"),
+                Some("high"),
+                None,
+                None,
+            ),
+            expr(
+                "__a023_dh2",
+                "ts_delta",
+                Some("high"),
+                None,
+                None,
+                None,
+                Some(2),
+            ),
+            expr(
+                "__a023_neg_dh2",
+                "elem_mul",
+                None,
+                Some("-1"),
+                Some("__a023_dh2"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha023",
+                "elem_where",
+                Some("__a023_cond"),
+                Some("__a023_neg_dh2"),
+                Some("0"),
+                None,
+                None,
+            ),
+            // alpha024
+            expr(
+                "__a024_sum100",
+                "ts_sum",
+                Some("close"),
+                None,
+                None,
+                Some(100),
+                None,
+            ),
+            expr(
+                "__a024_ma100",
+                "elem_div",
+                None,
+                Some("__a024_sum100"),
+                Some("100"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_dma100_100",
+                "ts_delta",
+                Some("__a024_ma100"),
+                None,
+                None,
+                None,
+                Some(100),
+            ),
+            expr(
+                "__a024_lag100",
+                "ts_lag",
+                Some("close"),
+                None,
+                None,
+                None,
+                Some(100),
+            ),
+            expr(
+                "__a024_slope",
+                "elem_div",
+                None,
+                Some("__a024_dma100_100"),
+                Some("__a024_lag100"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_cmp_lt",
+                "elem_lt",
+                None,
+                Some("__a024_slope"),
+                Some("0.05"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_cmp_eq",
+                "elem_eq",
+                None,
+                Some("__a024_slope"),
+                Some("0.05"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_cond",
+                "elem_or",
+                None,
+                Some("__a024_cmp_lt"),
+                Some("__a024_cmp_eq"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_min100",
+                "ts_min",
+                Some("close"),
+                None,
+                None,
+                Some(100),
+                None,
+            ),
+            expr(
+                "__a024_close_minus_min",
+                "elem_sub",
+                None,
+                Some("close"),
+                Some("__a024_min100"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_neg_close_minus_min",
+                "elem_mul",
+                None,
+                Some("-1"),
+                Some("__a024_close_minus_min"),
+                None,
+                None,
+            ),
+            expr(
+                "__a024_dclose3",
+                "ts_delta",
+                Some("close"),
+                None,
+                None,
+                None,
+                Some(3),
+            ),
+            expr(
+                "__a024_neg_dclose3",
+                "elem_mul",
+                None,
+                Some("-1"),
+                Some("__a024_dclose3"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha024",
+                "elem_where",
+                Some("__a024_cond"),
+                Some("__a024_neg_close_minus_min"),
+                Some("__a024_neg_dclose3"),
+                None,
+                None,
+            ),
+            // alpha025
+            expr(
+                "__a025_hc",
+                "elem_sub",
+                None,
+                Some("high"),
+                Some("close"),
+                None,
+                None,
+            ),
+            expr(
+                "__a025_ret_adv",
+                "elem_mul",
+                None,
+                Some("__returns"),
+                Some("__adv20"),
+                None,
+                None,
+            ),
+            expr(
+                "__a025_ret_adv_vwap",
+                "elem_mul",
+                None,
+                Some("__a025_ret_adv"),
+                Some("__vwap"),
+                None,
+                None,
+            ),
+            expr(
+                "__a025_core",
+                "elem_mul",
+                None,
+                Some("__a025_ret_adv_vwap"),
+                Some("__a025_hc"),
+                None,
+                None,
+            ),
+            expr(
+                "__a025_neg",
+                "elem_mul",
+                None,
+                Some("-1"),
+                Some("__a025_core"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha025",
+                "cs_rank",
+                Some("__a025_neg"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            // alpha027
+            expr(
+                "__a027_rank_v",
+                "cs_rank",
+                Some("volume"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "__a027_rank_vwap",
+                "cs_rank",
+                Some("__vwap"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "__a027_corr6",
+                "ts_corr",
+                None,
+                Some("__a027_rank_v"),
+                Some("__a027_rank_vwap"),
+                Some(6),
+                None,
+            ),
+            expr(
+                "__a027_sum2",
+                "ts_sum",
+                Some("__a027_corr6"),
+                None,
+                None,
+                Some(2),
+                None,
+            ),
+            expr(
+                "__a027_half",
+                "elem_div",
+                None,
+                Some("__a027_sum2"),
+                Some("2"),
+                None,
+                None,
+            ),
+            expr(
+                "__a027_rank",
+                "cs_rank",
+                Some("__a027_half"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "__a027_cond",
+                "elem_lt",
+                None,
+                Some("0.5"),
+                Some("__a027_rank"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha027",
+                "elem_where",
+                Some("__a027_cond"),
+                Some("-1"),
+                Some("1"),
+                None,
+                None,
+            ),
+            // alpha028
+            expr(
+                "__a028_corr",
+                "ts_corr",
+                None,
+                Some("__adv20"),
+                Some("low"),
+                Some(5),
+                None,
+            ),
+            expr(
+                "__a028_hl",
+                "elem_add",
+                None,
+                Some("high"),
+                Some("low"),
+                None,
+                None,
+            ),
+            expr(
+                "__a028_hl_half",
+                "elem_div",
+                None,
+                Some("__a028_hl"),
+                Some("2"),
+                None,
+                None,
+            ),
+            expr(
+                "__a028_add",
+                "elem_add",
+                None,
+                Some("__a028_corr"),
+                Some("__a028_hl_half"),
+                None,
+                None,
+            ),
+            expr(
+                "__a028_inner",
+                "elem_sub",
+                None,
+                Some("__a028_add"),
+                Some("close"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha028",
+                "cs_scale",
+                Some("__a028_inner"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            // alpha033
+            expr(
+                "__a033_oc",
+                "elem_div",
+                None,
+                Some("open"),
+                Some("close"),
+                None,
+                None,
+            ),
+            expr(
+                "__a033_1m",
+                "elem_sub",
+                None,
+                Some("1"),
+                Some("__a033_oc"),
+                None,
+                None,
+            ),
+            expr(
+                "__a033_pow",
+                "elem_pow",
+                None,
+                Some("__a033_1m"),
+                Some("1"),
+                None,
+                None,
+            ),
+            expr(
+                "__a033_neg",
+                "elem_mul",
+                None,
+                Some("-1"),
+                Some("__a033_pow"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha033",
+                "cs_rank",
+                Some("__a033_neg"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            // alpha034
+            expr(
+                "__a034_std2",
+                "ts_std",
+                Some("__returns"),
+                None,
+                None,
+                Some(2),
+                None,
+            ),
+            expr(
+                "__a034_std5",
+                "ts_std",
+                Some("__returns"),
+                None,
+                None,
+                Some(5),
+                None,
+            ),
+            expr(
+                "__a034_ratio",
+                "elem_div",
+                None,
+                Some("__a034_std2"),
+                Some("__a034_std5"),
+                None,
+                None,
+            ),
+            expr(
+                "__a034_rank_ratio",
+                "cs_rank",
+                Some("__a034_ratio"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "__a034_part1",
+                "elem_sub",
+                None,
+                Some("1"),
+                Some("__a034_rank_ratio"),
+                None,
+                None,
+            ),
+            expr(
+                "__a034_rank_d1",
+                "cs_rank",
+                Some("__ret_num"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "__a034_part2",
+                "elem_sub",
+                None,
+                Some("1"),
+                Some("__a034_rank_d1"),
+                None,
+                None,
+            ),
+            expr(
+                "__a034_inner",
+                "elem_add",
+                None,
+                Some("__a034_part1"),
+                Some("__a034_part2"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha034",
+                "cs_rank",
+                Some("__a034_inner"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            // alpha035
+            expr(
+                "__a035_tr_v",
+                "ts_rank",
+                Some("volume"),
+                None,
+                None,
+                Some(32),
+                None,
+            ),
+            expr(
+                "__a035_ch",
+                "elem_add",
+                None,
+                Some("close"),
+                Some("high"),
+                None,
+                None,
+            ),
+            expr(
+                "__a035_chl",
+                "elem_sub",
+                None,
+                Some("__a035_ch"),
+                Some("low"),
+                None,
+                None,
+            ),
+            expr(
+                "__a035_tr_chl",
+                "ts_rank",
+                Some("__a035_chl"),
+                None,
+                None,
+                Some(16),
+                None,
+            ),
+            expr(
+                "__a035_one_minus_chl",
+                "elem_sub",
+                None,
+                Some("1"),
+                Some("__a035_tr_chl"),
+                None,
+                None,
+            ),
+            expr(
+                "__a035_tr_ret",
+                "ts_rank",
+                Some("__returns"),
+                None,
+                None,
+                Some(32),
+                None,
+            ),
+            expr(
+                "__a035_one_minus_ret",
+                "elem_sub",
+                None,
+                Some("1"),
+                Some("__a035_tr_ret"),
+                None,
+                None,
+            ),
+            expr(
+                "__a035_mul_a",
+                "elem_mul",
+                None,
+                Some("__a035_tr_v"),
+                Some("__a035_one_minus_chl"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha035",
+                "elem_mul",
+                None,
+                Some("__a035_mul_a"),
+                Some("__a035_one_minus_ret"),
+                None,
+                None,
+            ),
+            // alpha041
+            expr(
+                "__a041_hl",
+                "elem_mul",
+                None,
+                Some("high"),
+                Some("low"),
+                None,
+                None,
+            ),
+            expr(
+                "__a041_sqrt",
+                "elem_pow",
+                None,
+                Some("__a041_hl"),
+                Some("0.5"),
+                None,
+                None,
+            ),
+            expr(
+                "alpha041",
+                "elem_sub",
+                None,
+                Some("__a041_sqrt"),
+                Some("__vwap"),
+                None,
+                None,
+            ),
+            // alpha042
+            expr(
+                "__a042_num_raw",
+                "elem_sub",
+                None,
+                Some("__vwap"),
+                Some("close"),
+                None,
+                None,
+            ),
+            expr(
+                "__a042_num",
+                "cs_rank",
+                Some("__a042_num_raw"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "__a042_den_raw",
+                "elem_add",
+                None,
+                Some("__vwap"),
+                Some("close"),
+                None,
+                None,
+            ),
+            expr(
+                "__a042_den",
+                "cs_rank",
+                Some("__a042_den_raw"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            expr(
+                "alpha042",
+                "elem_div",
+                None,
+                Some("__a042_num"),
+                Some("__a042_den"),
+                None,
+                None,
+            ),
+        ],
+    });
+
+    let offline = retain_outputs(&offline_all, &outputs);
+    let streaming = retain_from_ts(&streaming, 280);
+    let offline = retain_from_ts(&offline, 280);
+
+    assert_eq!(streaming.len(), offline.len(), "key count mismatch");
+    for (key, lhs) in &streaming {
+        let rhs = offline.get(key).expect("offline key missing");
+        assert_close(*lhs, *rhs, key);
+    }
+}
